@@ -1,0 +1,7 @@
+String jwt = approvalRequest.getToken(); // or get from header
+String userId = jwtTokenUtil.extractUsername(jwt);
+if (!approvalService.isApprover(userId)) {
+    return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
+}
+
+
