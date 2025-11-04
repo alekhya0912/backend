@@ -233,41 +233,29 @@ public class ApprovalController {
                 return ResponseEntity.status(HttpStatus.BAD_REQUEST).build();
             }
 
+            // Check if this user has already approved this batch
+            if (approvalRepository.existsByBatchIdAndApprovedByAndStatus(id, currentUserId, "approved")) {
+                return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(null);
+            }
+
+            // Check if batch has been rejected
+            if (approvalRepository.existsByBatchIdAndStatus(id, "rejected")) {
+                return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(null);
+            }
+
             List<Employee> emps = employeeRepository.findByBatchId(id);
             BigDecimal total=emps.stream()
                     .map(Employee::getSalaryAmount)
                     .filter(Objects::nonNull)
                     .reduce(BigDecimal.ZERO,BigDecimal::add);
 
-            String accNum=batch.getDebitAccount();
-            if(accNum==null || accNum.isBlank()){
-                return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(null);
-            }
-
-            BankAccount acct=bankAccountRepository.findByAccountNumber(accNum).orElse(null);
-            if(acct==null){
-                return ResponseEntity.status(HttpStatus.NOT_FOUND).build();
-            }
-            if(acct.getBalance().compareTo(total)<0){
-                return ResponseEntity.status(HttpStatus.CONFLICT).build();
-            }
-            acct.setBalance(acct.getBalance().subtract(total));
-            bankAccountRepository.save(acct);
-
-
-            for(Employee e:emps){
-                if(e.getPaymentRef() == null || e.getPaymentRef().isBlank()){
-                    String token = "TRX-"+ id +"-"+ UUID.randomUUID().toString().replace("-","").substring(0,8).toUpperCase();
-                    e.setPaymentRef(token);
-                }
-            }
-
-            employeeRepository.saveAll(emps);
-            batch.setPaymentStatus("approved");
-            batch.setLastPaymentDate(java.time.LocalDateTime.now());
-            batchRepository.save(batch);
+            // Calculate required approvers
+            int approversRequired = calculateApproversRequired(total, batch.getCurrency());
             
-            // Create approval record
+            // Count current approved approvals
+            long approvedCount = approvalRepository.countByBatchIdAndStatus(id, "approved");
+            
+            // Create approval record for this approver
             Approval approval = new Approval();
             approval.setBatchId(id);
             approval.setApprovedBy(currentUserId);
@@ -276,11 +264,45 @@ public class ApprovalController {
             approval.setApprovedDate(java.time.LocalDateTime.now());
             approvalRepository.save(approval);
             
+            // Check if we've reached the required number of approvers
+            approvedCount = approvalRepository.countByBatchIdAndStatus(id, "approved");
+            
+            if (approvedCount >= approversRequired) {
+                // All required approvers have approved - process the payment
+                String accNum=batch.getDebitAccount();
+                if(accNum==null || accNum.isBlank()){
+                    return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(null);
+                }
+
+                BankAccount acct=bankAccountRepository.findByAccountNumber(accNum).orElse(null);
+                if(acct==null){
+                    return ResponseEntity.status(HttpStatus.NOT_FOUND).build();
+                }
+                if(acct.getBalance().compareTo(total)<0){
+                    return ResponseEntity.status(HttpStatus.CONFLICT).build();
+                }
+                acct.setBalance(acct.getBalance().subtract(total));
+                bankAccountRepository.save(acct);
+
+                for(Employee e:emps){
+                    if(e.getPaymentRef() == null || e.getPaymentRef().isBlank()){
+                        String token = "TRX-"+ id +"-"+ UUID.randomUUID().toString().replace("-","").substring(0,8).toUpperCase();
+                        e.setPaymentRef(token);
+                    }
+                }
+
+                employeeRepository.saveAll(emps);
+                batch.setPaymentStatus("approved");
+                batch.setLastPaymentDate(java.time.LocalDateTime.now());
+                batchRepository.save(batch);
+            }
+            // If not fully approved yet, batch status remains "Pending"
+            
             ApprovalBatchDto dto = mapBatchToApprovalDto(batch);
             dto.setApprovedBy(currentUserId);
             dto.setApprovedDate(approval.getApprovedDate());
             dto.setApprovalComments(approvalRequest.getComments());
-            dto.setStatus("approved");
+            dto.setStatus(batch.getPaymentStatus() != null ? batch.getPaymentStatus().toLowerCase() : "pending");
             return ResponseEntity.ok(dto);
         } catch (Exception e) {
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
@@ -330,11 +352,13 @@ public class ApprovalController {
             if (batch.getPaymentStatus() == null || !batch.getPaymentStatus().equalsIgnoreCase("Pending")) {
                 return ResponseEntity.status(HttpStatus.BAD_REQUEST).build();
             }
+            
+            // Rejection immediately rejects the batch - no need for multiple approvers
             batch.setPaymentStatus("rejected");
             batch.setLastPaymentDate(java.time.LocalDateTime.now());
             batchRepository.save(batch);
             
-            // Create approval record
+            // Create approval record for rejection
             Approval approval = new Approval();
             approval.setBatchId(id);
             approval.setApprovedBy(currentUserId);
@@ -373,17 +397,24 @@ public class ApprovalController {
         // Calculate approvers required based on amount and currency
         int approversRequired = calculateApproversRequired(total, batch.getCurrency());
         dto.setApproversRequired(approversRequired);
-        dto.setApproversAssigned(1);
+        
+        // Count how many approvers have actually approved this batch
+        long approversAssigned = approvalRepository.countByBatchIdAndStatus(batch.getId(), "approved");
+        dto.setApproversAssigned((int) approversAssigned);
+        
         dto.setDebitAccount(batch.getDebitAccount());
         dto.setDescription(null);
         
-        // Get approval information from Approval table
-        java.util.Optional<Approval> approvalOpt = approvalRepository.findByBatchId(batch.getId());
-        if (approvalOpt.isPresent()) {
-            Approval approval = approvalOpt.get();
-            dto.setApprovedBy(approval.getApprovedBy());
-            dto.setApprovedDate(approval.getApprovedDate());
-            dto.setApprovalComments(approval.getComments());
+        // Get the most recent approval information from Approval table
+        java.util.List<Approval> approvals = approvalRepository.findAllByBatchId(batch.getId());
+        if (!approvals.isEmpty()) {
+            // Get the most recent approval (for display purposes)
+            Approval latestApproval = approvals.stream()
+                    .max(java.util.Comparator.comparing(Approval::getApprovedDate))
+                    .orElse(approvals.get(0));
+            dto.setApprovedBy(latestApproval.getApprovedBy());
+            dto.setApprovedDate(latestApproval.getApprovedDate());
+            dto.setApprovalComments(latestApproval.getComments());
         }
         
         return dto;
@@ -411,6 +442,42 @@ public class ApprovalController {
         return 1; // Default to 1 approver
     }
 
+    @GetMapping("/{id}/check-approval")
+    @Operation(summary = "Check if current user has approved a batch", description = "Check if the current logged-in user has already approved the specified batch")
+    @ApiResponses(value = {
+            @ApiResponse(responseCode = "200", description = "Check completed successfully"),
+            @ApiResponse(responseCode = "401", description = "Unauthorized"),
+            @ApiResponse(responseCode = "404", description = "Batch not found")
+    })
+    public ResponseEntity<java.util.Map<String, Object>> checkUserApproval(
+            @Parameter(description = "Batch ID", required = true) @PathVariable Long id,
+            @RequestHeader(value = "Authorization", required = false) String authHeader) {
+        try {
+            String currentUserId = null;
+            if (authHeader != null && authHeader.startsWith("Bearer ")) {
+                String token = authHeader.substring(7);
+                if (jwtTokenUtil.validateToken(token)) {
+                    currentUserId = jwtTokenUtil.getUsernameFromToken(token);
+                }
+            }
+            
+            if (currentUserId == null) {
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+            }
+            
+            boolean hasApproved = approvalRepository.existsByBatchIdAndApprovedByAndStatus(id, currentUserId, "approved");
+            boolean hasRejected = approvalRepository.existsByBatchIdAndApprovedByAndStatus(id, currentUserId, "rejected");
+            
+            java.util.Map<String, Object> response = new java.util.HashMap<>();
+            response.put("hasApproved", hasApproved);
+            response.put("hasRejected", hasRejected);
+            
+            return ResponseEntity.ok(response);
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
+    }
+
     @GetMapping("/statistics")
     @Operation(summary = "Get approval statistics", description = "Get statistics about pending and reviewed batches")
     @ApiResponses(value = {
@@ -430,7 +497,7 @@ public class ApprovalController {
 }
 
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import PayrollCard from './PayrollCard';
 import PayrollDetailsModal from './PayrollDetailsModal';
 import ApprovalService from '../../services/ApprovalService';
@@ -450,8 +517,49 @@ const ApproverPage = () => {
   const [pendingAction, setPendingAction] = useState(null);
   const [authError, setAuthError] = useState('');
   const [currentUserId, setCurrentUserId] = useState(null);
+  const [userApprovals, setUserApprovals] = useState({}); // Track which batches user has approved
 
-  // Load current user and pending payrolls from API
+  // Helper to reload batches after approval
+  const loadPendingBatches = useCallback(async () => {
+    setIsLoading(true);
+    try {
+      const apiBatches = await ApprovalService.getPendingBatches();
+      const transformedBatches = apiBatches
+        .map(ApprovalService.transformBatchData)
+        .filter(b => (b.debitAccount && String(b.debitAccount).trim() !== '') && (b.currency && String(b.currency).trim() !== ''));
+      setPayrolls(transformedBatches);
+      
+      // Check which batches the current user has already approved
+      if (currentUserId) {
+        const approvals = {};
+        for (const batch of transformedBatches) {
+          try {
+            const checkResult = await ApprovalService.checkUserApproval(batch.id);
+            approvals[batch.id] = checkResult.hasApproved || false;
+          } catch (err) {
+            console.error(`Error checking approval for batch ${batch.id}:`, err);
+            approvals[batch.id] = false;
+          }
+        }
+        setUserApprovals(approvals);
+      }
+      
+      try {
+        const employees = await getEmployees();
+        setAllEmployees(Array.isArray(employees) ? employees : []);
+      } catch (empErr) {
+        console.error('Error loading employees:', empErr);
+        setAllEmployees([]);
+      }
+    } catch (error) {
+      console.error('Error loading pending batches:', error);
+      setPayrolls([]);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [currentUserId]);
+
+  // Load current user
   useEffect(() => {
     const loadCurrentUser = async () => {
       try {
@@ -462,33 +570,15 @@ const ApproverPage = () => {
       }
     };
 
-    const loadPendingBatches = async () => {
-      setIsLoading(true);
-      try {
-        const apiBatches = await ApprovalService.getPendingBatches();
-        const transformedBatches = apiBatches
-          .map(ApprovalService.transformBatchData)
-          .filter(b => (b.debitAccount && String(b.debitAccount).trim() !== '') && (b.currency && String(b.currency).trim() !== ''));
-        setPayrolls(transformedBatches);
-        try {
-          const employees = await getEmployees();
-          setAllEmployees(Array.isArray(employees) ? employees : []);
-        } catch (empErr) {
-          console.error('Error loading employees:', empErr);
-          setAllEmployees([]);
-        }
-      } catch (error) {
-        console.error('Error loading pending batches:', error);
-        // Fallback to empty array if API fails
-        setPayrolls([]);
-      } finally {
-        setIsLoading(false);
-      }
-    };
-
     loadCurrentUser();
-    loadPendingBatches();
   }, []);
+
+  // Load batches when current user is loaded
+  useEffect(() => {
+    if (currentUserId) {
+      loadPendingBatches();
+    }
+  }, [currentUserId, loadPendingBatches]);
 
   const handleViewDetails = (payroll) => {
     setSelectedPayroll(payroll);
@@ -556,18 +646,37 @@ const ApproverPage = () => {
       
       await ApprovalService.approveBatch(batchId, approvalData);
       
-      // Remove from pending list
-      setPayrolls(prevPayrolls => 
-        prevPayrolls.filter(payroll => payroll.id !== payrollId)
-      );
+      // Update user approvals state
+      setUserApprovals(prev => ({ ...prev, [payrollId]: true }));
+      
+      // Reload batches to get updated approver count
+      await loadPendingBatches();
+      
+      // Get updated batch data after reload
+      const updatedPayrolls = await ApprovalService.getPendingBatches();
+      const transformedBatches = updatedPayrolls
+        .map(ApprovalService.transformBatchData)
+        .filter(b => (b.debitAccount && String(b.debitAccount).trim() !== '') && (b.currency && String(b.currency).trim() !== ''));
+      const updatedItem = transformedBatches.find(p => String(p.id) === String(payrollId));
+      
+      // Show success message
+      if (updatedItem) {
+        const approversAssigned = updatedItem.approversAssigned || 0;
+        const approversRequired = updatedItem.approversRequired || 1;
+        if (approversAssigned >= approversRequired) {
+          alert('Payroll batch approved successfully! All required approvers have approved.');
+        } else {
+          alert(`Payroll batch approved successfully! ${approversAssigned}/${approversRequired} approvers have approved.`);
+        }
+      } else {
+        // Batch is fully approved and removed from pending
+        alert('Payroll batch approved successfully! All required approvers have approved.');
+      }
       
       // Close modal if open
       if (showDetailsModal) {
         handleCloseModal();
       }
-      
-      // Show success message
-      alert('Payroll batch approved successfully!');
       try {
         window.dispatchEvent(new Event('approvals:updated'));
       } catch (_) {}
@@ -794,6 +903,7 @@ const ApproverPage = () => {
                   onApprove={(id) => handleAuthPrompt('approve', id)}
                   onReject={(id) => handleAuthPrompt('reject', id)}
                   isLoading={isLoading}
+                  hasUserApproved={userApprovals[payroll.id] || false}
                 />
               ))}
             </div>
@@ -809,6 +919,7 @@ const ApproverPage = () => {
             onApprove={(id) => handleAuthPrompt('approve', id)}
             onReject={(id) => handleAuthPrompt('reject', id)}
             isLoading={isLoading}
+            hasUserApproved={selectedPayroll ? (userApprovals[selectedPayroll.id] || false) : false}
           />
         )}
 
@@ -886,3 +997,359 @@ const ApproverPage = () => {
 };
 
 export default ApproverPage;
+
+
+  // ------------------ Check if user has approved a batch ------------------
+  static async checkUserApproval(batchId) {
+    try {
+      const response = await apiFetch(`/api/approvals/${batchId}/check-approval`, { method: "GET" });
+      if (!response.ok) throw new Error(`Error checking approval: ${response.status}`);
+      return await response.json();
+    } catch (error) {
+      console.error("Error checking user approval:", error);
+      throw error;
+    }
+  }
+
+
+package paymentinitiationbackend.repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+import paymentinitiationbackend.model.Approval;
+
+import java.util.List;
+import java.util.Optional;
+
+@Repository
+public interface ApprovalRepository extends JpaRepository<Approval, Long> {
+    
+    Optional<Approval> findByBatchId(Long batchId);
+    
+    boolean existsByBatchId(Long batchId);
+    
+    // Find all approvals for a batch
+    List<Approval> findAllByBatchId(Long batchId);
+    
+    // Count approved approvals for a batch
+    long countByBatchIdAndStatus(Long batchId, String status);
+    
+    // Check if a user has already approved a batch
+    boolean existsByBatchIdAndApprovedByAndStatus(Long batchId, String approvedBy, String status);
+}
+
+import React from 'react';
+import "./ApprovalPayment.css";
+const ActionButtons = ({ onApprove, onReject, isLoading = false, approversAssigned = 0, approversRequired = 1, hasUserApproved = false }) => {
+  const isFullyApproved = approversAssigned >= approversRequired;
+  const canApprove = !isLoading && !hasUserApproved && !isFullyApproved;
+  
+  return (
+    <div className="action-buttons">
+      <button 
+        className="btn btn-success"
+        onClick={onApprove}
+        disabled={!canApprove}
+        title={hasUserApproved ? "You have already approved this batch" : isFullyApproved ? "All required approvers have approved" : ""}
+      >
+        {isLoading ? 'Loading...' : hasUserApproved ? 'Already Approved' : isFullyApproved ? 'Fully Approved' : 'Approve'} 
+      </button>
+      <button 
+        className="btn btn-danger"
+        onClick={onReject}
+        disabled={isLoading || isFullyApproved}
+        title={isFullyApproved ? "Batch is fully approved and cannot be rejected" : ""}
+      >
+        {isLoading ? 'Loading...' : 'Reject'} 
+      </button>
+    </div>
+  );
+};
+
+export default ActionButtons;
+
+import React from 'react';
+import ActionButtons from './ActionButtons';
+
+const PayrollCard = ({ payroll, onViewDetails, onApprove, onReject, isLoading, hasUserApproved = false }) => {
+  const formatCurrency = (amount, currency) => {
+    if (currency === 'INR') {
+      return new Intl.NumberFormat('en-IN', {
+        style: 'currency',
+        currency: 'INR'
+      }).format(amount);
+    } else {
+      return new Intl.NumberFormat('en-US', {
+        style: 'currency',
+        currency: 'USD'
+      }).format(amount);
+    }
+  };
+
+  const formatDate = (dateString) => {
+    return new Date(dateString).toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric'
+    });
+  };
+
+  return (
+    <div className="payroll-card">
+      <div className="payroll-card-header">
+        <div className="payroll-card-title">
+          <div className="batch-id">ID: {payroll.id}</div>
+          <h3>{payroll.batchName}</h3>
+          <div className={`status-badge status-${payroll.status}`}>
+            {payroll.status.toUpperCase()}
+          </div>
+        </div>
+        <div className="payroll-card-amount">
+          {formatCurrency(payroll.totalAmount, payroll.currency)}
+        </div>
+      </div>
+
+      <div className="payroll-card-body">
+        <div className="payroll-card-details">
+          <div className="payroll-detail">
+            <span className="detail-label">Employees</span>
+            <span className="detail-value">{payroll.employeeCount}</span>
+          </div>
+          <div className="payroll-detail">
+            <span className="detail-label">Debit Account</span>
+            <span className="detail-value">{payroll.debitAccount || 'N/A'}</span>
+          </div>
+          <div className="payroll-detail">
+            <span className="detail-label">Currency</span>
+            <span className="detail-value">{payroll.currency}</span>
+          </div>
+          <div className="payroll-detail">
+            <span className="detail-label">Approvers</span>
+            <span className="detail-value">
+              {payroll.approversAssigned}/{payroll.approversRequired}
+            </span>
+          </div>
+          <div className="payroll-detail">
+            <span className="detail-label">Created By</span>
+            <span className="detail-value">{payroll.createdBy}</span>
+          </div>
+          <div className="payroll-detail">
+            <span className="detail-label">Date</span>
+            <span className="detail-value">{formatDate(payroll.createdDate)}</span>
+          </div>
+        </div>
+
+        {payroll.description && (
+          <div className="payroll-card-description">
+            <p>{payroll.description}</p>
+          </div>
+        )}
+      </div>
+
+      <div className="payroll-card-footer">
+        <button 
+          className="btn btn-outline"
+          onClick={() => onViewDetails(payroll)}
+        >
+          View Details
+        </button>
+        
+        <ActionButtons
+          onApprove={() => onApprove(payroll.id)}
+          onReject={() => onReject(payroll.id)}
+          isLoading={isLoading}
+          approversAssigned={payroll.approversAssigned || 0}
+          approversRequired={payroll.approversRequired || 1}
+          hasUserApproved={hasUserApproved}
+        />
+      </div>
+    </div>
+  );
+};
+
+export default PayrollCard;
+
+import React from 'react';
+import ActionButtons from './ActionButtons';
+
+const PayrollDetailsModal = ({ payroll, employees = [], onClose, onApprove, onReject, isLoading, showActionButtons = true, hasUserApproved = false }) => {
+  if (!payroll) return null;
+
+  const formatCurrency = (amount, currency) => {
+    if (currency === 'INR') {
+      return new Intl.NumberFormat('en-IN', {
+        style: 'currency',
+        currency: 'INR'
+      }).format(amount);
+    } else {
+      return new Intl.NumberFormat('en-US', {
+        style: 'currency',
+        currency: 'USD'
+      }).format(amount);
+    }
+  };
+
+  const formatDate = (dateString) => {
+    return new Date(dateString).toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric'
+    });
+  };
+
+  return (
+    <div className="modal-overlay">
+      <div className="modal payroll-details-modal">
+        <div className="modal-header">
+          <h2 className="modal-title">Payroll Batch Details</h2>
+          <button className="modal-close" onClick={onClose}>×</button>
+        </div>
+
+        <div className="modal-body">
+          {/* Header Section */}
+          <div className="details-header">
+            <div className="details-title-section">
+              <div className="details-batch-id">Batch ID: {payroll.id}</div>
+              <h3 className="details-title">{payroll.batchName}</h3>
+              <div className={`status-badge status-${payroll.status}`}>
+                {payroll.status.toUpperCase()}
+              </div>
+            </div>
+            <div className="details-amount">
+              <div className="amount-value">{formatCurrency(payroll.totalAmount, payroll.currency)}</div>
+              <div className="amount-label">Total Amount ({payroll.currency})</div>
+            </div>
+          </div>
+
+          {/* Description */}
+          {payroll.description && (
+            <div className="details-description">
+              <h4>Description</h4>
+              <p>{payroll.description}</p>
+            </div>
+          )}
+
+          {/* Key Metrics */}
+          <div className="details-metrics">
+            <div className="metric-card">
+              <div className="metric-icon"></div>
+              <div className="metric-content">
+                <div className="metric-value">{payroll.employeeCount}</div>
+                <div className="metric-label">Employees</div>
+              </div>
+            </div>
+            <div className="metric-card">
+              <div className="metric-icon"></div>
+              <div className="metric-content">
+                <div className="metric-value">{payroll.currency}</div>
+                <div className="metric-label">Currency</div>
+              </div>
+            </div>
+            <div className="metric-card">
+              <div className="metric-icon"></div>
+              <div className="metric-content">
+                <div className="metric-value">
+                  {payroll.approversAssigned}/{payroll.approversRequired}
+                </div>
+                <div className="metric-label">Approvers</div>
+              </div>
+            </div>
+            <div className="metric-card">
+              <div className="metric-icon"></div>
+              <div className="metric-content">
+                <div className="metric-value">{payroll.debitAccount || 'N/A'}</div>
+                <div className="metric-label">Debit Account</div>
+              </div>
+            </div>
+            <div className="metric-card">
+              <div className="metric-icon"></div>
+              <div className="metric-content">
+                <div className="metric-value">{payroll.createdBy}</div>
+                <div className="metric-label">Created By</div>
+              </div>
+            </div>
+            <div className="metric-card">
+              <div className="metric-icon"></div>
+              <div className="metric-content">
+                <div className="metric-value">{formatDate(payroll.createdDate)}</div>
+                <div className="metric-label">Created Date</div>
+              </div>
+            </div>
+          </div>
+
+          {/* Employee Breakdown */}
+          <div className="details-breakdown">
+            <h4>Employee Breakdown</h4>
+            <div className="breakdown-table">
+              <div className="table-header">
+                <div className="table-cell">Employee ID</div>
+                <div className="table-cell">Name</div>
+                <div className="table-cell">Department</div>
+                <div className="table-cell">Amount</div>
+              </div>
+              {(employees && employees.length > 0
+                ? employees
+                : Array.from({ length: payroll.employeeCount }, (_, i) => ({
+                    id: `EMP${String(i + 1).padStart(3, '0')}`,
+                    name: `Employee ${i + 1}`,
+                    department: '—',
+                    salaryAmount: (payroll.totalAmount || 0) / Math.max(1, payroll.employeeCount)
+                  }))
+              ).map((emp, idx) => (
+                <div key={emp.id || idx} className="table-row">
+                  <div className="table-cell">{emp.id || `EMP${String(idx + 1).padStart(3, '0')}`}</div>
+                  <div className="table-cell">{emp.name || `Employee ${idx + 1}`}</div>
+                  <div className="table-cell">{emp.department || '—'}</div>
+                  <div className="table-cell amount">{formatCurrency(Number(emp.salaryAmount || 0), payroll.currency)}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Decision Details (only for reviewed batches) */}
+          {payroll.status !== 'pending' && (
+            <div className="details-description">
+              <h4>Decision</h4>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+                <div>
+                  <div style={{ fontSize: '12px', color: '#64748b' }}>Status</div>
+                  <div style={{ fontWeight: 600, marginTop: '4px' }}>{payroll.status?.toUpperCase()}</div>
+                </div>
+                <div>
+                  <div style={{ fontSize: '12px', color: '#64748b' }}>Decision Date</div>
+                  <div style={{ fontWeight: 600, marginTop: '4px' }}>{payroll.approvedDate ? formatDate(payroll.approvedDate) : '—'}</div>
+                </div>
+                <div>
+                  <div style={{ fontSize: '12px', color: '#64748b' }}>Approved By</div>
+                  <div style={{ fontWeight: 600, marginTop: '4px' }}>{payroll.approvedBy || '—'}</div>
+                </div>
+                <div>
+                  <div style={{ fontSize: '12px', color: '#64748b' }}>Comments</div>
+                  <div style={{ fontWeight: 600, marginTop: '4px', wordBreak: 'break-word' }}>{payroll.approvalComments || '—'}</div>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="modal-footer">
+          <button className="btn btn-outline" onClick={onClose}>
+            Close
+          </button>
+          {showActionButtons && (
+            <ActionButtons
+              onApprove={() => onApprove(payroll.id)}
+              onReject={() => onReject(payroll.id)}
+              isLoading={isLoading}
+              approversAssigned={payroll.approversAssigned || 0}
+              approversRequired={payroll.approversRequired || 1}
+              hasUserApproved={hasUserApproved}
+            />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default PayrollDetailsModal;
