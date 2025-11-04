@@ -99,13 +99,36 @@ public class ApprovalController {
     public ResponseEntity<List<ApprovalBatchDto>> getReviewedBatches() {
         try {
             List<Batch> batches = batchRepository.findAll();
+            System.out.println("Total batches found: " + batches.size());
+            // Filter for approved or rejected batches
             List<ApprovalBatchDto> reviewed = batches.stream()
-                    .filter(b -> b.getPaymentStatus() != null && (b.getPaymentStatus().equalsIgnoreCase("approved") || b.getPaymentStatus().equalsIgnoreCase("rejected")))
-                    .map(this::mapBatchToApprovalDto)
+                    .filter(b -> {
+                        String status = b.getPaymentStatus();
+                        System.out.println("Batch ID: " + b.getId() + ", Status: " + status);
+                        boolean isReviewed = status != null && (status.equalsIgnoreCase("approved") || status.equalsIgnoreCase("rejected"));
+                        if (isReviewed) {
+                            System.out.println("Batch " + b.getId() + " is reviewed (status: " + status + ")");
+                        }
+                        return isReviewed;
+                    })
+                    .map(batch -> {
+                        try {
+                            return mapBatchToApprovalDto(batch);
+                        } catch (Exception e) {
+                            System.err.println("Error mapping batch " + batch.getId() + ": " + e.getMessage());
+                            e.printStackTrace();
+                            return null;
+                        }
+                    })
+                    .filter(java.util.Objects::nonNull)
                     .toList();
+            System.out.println("Reviewed batches count: " + reviewed.size());
             return ResponseEntity.ok(reviewed);
         } catch (Exception e) {
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+            System.err.println("Error in getReviewedBatches: " + e.getMessage());
+            e.printStackTrace(); // Log the exception for debugging
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(java.util.Collections.emptyList());
         }
     }
 
@@ -382,65 +405,91 @@ public class ApprovalController {
 }
 
 
-
 import React, { useState, useEffect } from 'react';
-import PayrollCard from './PayrollCard';
 import PayrollDetailsModal from './PayrollDetailsModal';
+import Navbar from '../../common/Navbar';
 import ApprovalService from '../../services/ApprovalService';
 import { getEmployees } from '../../services/payrollapi';
-import { getCurrentUser } from '../../services/api';
 
-const ApproverPage = () => {
-  const [payrolls, setPayrolls] = useState([]);
+const ApprovalsPage = () => {
+  const [allApprovals, setAllApprovals] = useState([]);
+  const [filterStatus, setFilterStatus] = useState('all');
   const [selectedPayroll, setSelectedPayroll] = useState(null);
   const [showDetailsModal, setShowDetailsModal] = useState(false);
-  const [isLoading, setIsLoading] = useState(false);
   const [allEmployees, setAllEmployees] = useState([]);
-  const [searchId, setSearchId] = useState('');
-  const [showAuthModal, setShowAuthModal] = useState(false);
-  const [authPassword, setAuthPassword] = useState('');
-  const [pendingAction, setPendingAction] = useState(null);
-  const [authError, setAuthError] = useState('');
-  const [currentUserId, setCurrentUserId] = useState(null);
 
-  // Load current user and pending payrolls from API
+  // Load reviewed batches from API
+  const loadReviewedBatches = async () => {
+    try {
+      console.log('Loading reviewed batches...');
+      const apiBatches = await ApprovalService.getReviewedBatches();
+      console.log('Received batches from API:', apiBatches);
+      const transformedBatches = apiBatches.map(ApprovalService.transformBatchData);
+      console.log('Transformed batches:', transformedBatches);
+      setAllApprovals(transformedBatches);
+    } catch (error) {
+      console.error('Error loading reviewed batches:', error);
+      // Fallback to empty array if API fails
+      setAllApprovals([]);
+    }
+  };
+
   useEffect(() => {
-    const loadCurrentUser = async () => {
-      try {
-        const userData = await getCurrentUser();
-        setCurrentUserId(userData.userId);
-      } catch (error) {
-        console.error('Error loading current user:', error);
+    loadReviewedBatches();
+    (async ()=>{
+      try{
+        const employees=await getEmployees();
+        setAllEmployees(Array.isArray(employees) ? employees : []);
       }
-    };
-
-    const loadPendingBatches = async () => {
-      setIsLoading(true);
-      try {
-        const apiBatches = await ApprovalService.getPendingBatches();
-        const transformedBatches = apiBatches
-          .map(ApprovalService.transformBatchData)
-          .filter(b => (b.debitAccount && String(b.debitAccount).trim() !== '') && (b.currency && String(b.currency).trim() !== ''));
-        setPayrolls(transformedBatches);
-        try {
-          const employees = await getEmployees();
-          setAllEmployees(Array.isArray(employees) ? employees : []);
-        } catch (empErr) {
-          console.error('Error loading employees:', empErr);
-          setAllEmployees([]);
-        }
-      } catch (error) {
-        console.error('Error loading pending batches:', error);
-        // Fallback to empty array if API fails
-        setPayrolls([]);
-      } finally {
-        setIsLoading(false);
+      catch(empErr){
+        console.error('Error loading employees: ',empErr);
+        setAllEmployees([]);
       }
-    };
+    })();
 
-    loadCurrentUser();
-    loadPendingBatches();
+    const onUpdated = () => {
+      loadReviewedBatches();
+    };
+    window.addEventListener('approvals:updated', onUpdated);
+    return () => {
+      window.removeEventListener('approvals:updated', onUpdated);
+    };
   }, []);
+
+  // Filter approvals based on selected status
+  const filteredApprovals = allApprovals.filter(payroll => {
+    if (filterStatus === 'all') return true;
+    return payroll.status === filterStatus;
+  });
+
+  // Calculate statistics
+  const stats = {
+    total: allApprovals.length,
+    approved: allApprovals.filter(p => p.status === 'approved').length,
+    rejected: allApprovals.filter(p => p.status === 'rejected').length
+  };
+
+  const formatDate = (dateString) => {
+    return new Date(dateString).toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric'
+    });
+  };
+
+  const formatCurrency = (amount, currency) => {
+    if (currency === 'INR') {
+      return new Intl.NumberFormat('en-IN', {
+        style: 'currency',
+        currency: 'INR'
+      }).format(amount);
+    } else {
+      return new Intl.NumberFormat('en-US', {
+        style: 'currency',
+        currency: 'USD'
+      }).format(amount);
+    }
+  };
 
   const handleViewDetails = (payroll) => {
     setSelectedPayroll(payroll);
@@ -452,293 +501,163 @@ const ApproverPage = () => {
     setSelectedPayroll(null);
   };
 
-  const handleAuthPrompt = (action, payrollId) => {
-    setPendingAction({ action, payrollId });
-    setShowAuthModal(true);
-    setAuthPassword('');
-    setAuthError('');
-  };
-
-  const handleAuthSubmit = async () => {
-    if (!authPassword.trim()) {
-      setAuthError('Please enter your password.');
-      return;
-    }
-    
-    setShowAuthModal(false);
-    setAuthError('');
-    
-    // Execute the pending action - password will be verified on the backend
-    if (pendingAction.action === 'approve') {
-      handleApprove(pendingAction.payrollId);
-    } else if (pendingAction.action === 'reject') {
-      handleReject(pendingAction.payrollId);
-    }
-    
-    setPendingAction(null);
-  };
-
-  const handleAuthCancel = () => {
-    setShowAuthModal(false);
-    setPendingAction(null);
-    setAuthPassword('');
-    setAuthError('');
-  };
-
-  const handleApprove = async (payrollId) => {
-    setIsLoading(true);
-    
-    try {
-      const item = payrolls.find(p => p.id === payrollId);
-      const batchId = item?.batchId || item?.id;
-      const approvalData = {
-        action: 'approve',
-        password: authPassword,
-        comments: 'Approved',
-        approverName: currentUserId || 'Approver'
-      };
-      
-      await ApprovalService.approveBatch(batchId, approvalData);
-      
-      // Remove from pending list
-      setPayrolls(prevPayrolls => 
-        prevPayrolls.filter(payroll => payroll.id !== payrollId)
-      );
-      
-      // Close modal if open
-      if (showDetailsModal) {
-        handleCloseModal();
-      }
-      
-      // Show success message
-      alert('Payroll batch approved successfully!');
-      try {
-        window.dispatchEvent(new Event('approvals:updated'));
-      } catch (_) {}
-    } catch (error) {
-      console.error('Error approving batch:', error);
-      if (error.status === 401 || (error.message && error.message.includes('401'))) {
-        alert('Invalid password. Please try again.');
-        setShowAuthModal(true);
-        setPendingAction({ action: 'approve', payrollId });
-        setAuthPassword('');
-        setAuthError('Invalid password. Please try again.');
-      } else {
-        alert(`Error approving batch: ${error.message || 'Unknown error'}`);
-      }
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  const handleReject = async (payrollId) => {
-    setIsLoading(true);
-    
-    try {
-      const item = payrolls.find(p => p.id === payrollId);
-      const batchId = item?.batchId || item?.id;
-      const approvalData = {
-        action: 'reject',
-        password: authPassword,
-        comments: 'Rejected',
-        approverName: currentUserId || 'Approver'
-      };
-      
-      await ApprovalService.rejectBatch(batchId, approvalData);
-      
-      // Remove from pending list
-      setPayrolls(prevPayrolls => 
-        prevPayrolls.filter(payroll => payroll.id !== payrollId)
-      );
-      
-      // Close modal if open
-      if (showDetailsModal) {
-        handleCloseModal();
-      }
-      
-      // Show success message
-      alert('Payroll batch rejected successfully!');
-      try {
-        window.dispatchEvent(new Event('approvals:updated'));
-      } catch (_) {}
-    } catch (error) {
-      console.error('Error rejecting batch:', error);
-      if (error.status === 401 || (error.message && error.message.includes('401'))) {
-        alert('Invalid password. Please try again.');
-        setShowAuthModal(true);
-        setPendingAction({ action: 'reject', payrollId });
-        setAuthPassword('');
-        setAuthError('Invalid password. Please try again.');
-      } else {
-        alert(`Error rejecting batch: ${error.message || 'Unknown error'}`);
-      }
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  // Filter only pending payrolls and apply search filter
-  const pendingPayrolls = payrolls.filter(payroll => {
-    const isPending = payroll.status === 'pending';
-    const matchesSearch = searchId === '' || payroll.id.toLowerCase().includes(searchId.toLowerCase());
-    return isPending && matchesSearch;
-  }).sort((a, b) => new Date(a.createdDate) - new Date(b.createdDate)); // Sort by created date (oldest first)
-
   return (
-    <div className="approver-page">
+    <div>
+      <Navbar />
+    <div className="approvals-page">
       <div className="container">
         {/* Header */}
         <div className="page-header">
-          <h1 className="page-title">Payroll Approval Dashboard</h1>
-          <p className="page-subtitle">
-            Review and approve pending payroll batches
-          </p>
+          <div className="header-content">
+            <div className="header-text">
+              <h1 className="page-title">Reviewed Batches</h1>
+              <p className="page-subtitle">
+                View and manage your reviewed payroll batches
+              </p>
+            </div>
+            <button 
+              className="btn btn-outline"
+              onClick={loadReviewedBatches}
+              style={{ marginTop: '8px' }}
+            >
+              🔄 Refresh
+            </button>
+          </div>
         </div>
 
         {/* Statistics */}
         <div className="stats-section">
-              <div className="stat-card">
-                <div className="stat-icon pending"></div>
+          <div className="stat-card">
+            <div className="stat-icon total"></div>
             <div className="stat-content">
-              <div className="stat-value">{pendingPayrolls.length}</div>
-              <div className="stat-label">Pending Approvals</div>
+              <div className="stat-value">{stats.total}</div>
+              <div className="stat-label">Total Reviewed</div>
             </div>
           </div>
-              <div className="stat-card">
-                <div className="stat-icon usd"></div>
+          <div className="stat-card">
+            <div className="stat-icon approved"></div>
             <div className="stat-content">
-              <div className="stat-value">
-                {pendingPayrolls
-                  .filter(p => p.currency === 'USD')
-                  .reduce((sum, p) => sum + p.totalAmount, 0)
-                  .toLocaleString('en-US', {
-                    style: 'currency',
-                    currency: 'USD',
-                    minimumFractionDigits: 0
-                  })}
-              </div>
-              <div className="stat-label">USD Amount</div>
+              <div className="stat-value">{stats.approved}</div>
+              <div className="stat-label">Approved</div>
             </div>
           </div>
-              <div className="stat-card">
-                <div className="stat-icon inr"></div>
+          <div className="stat-card">
+            <div className="stat-icon rejected"></div>
             <div className="stat-content">
-              <div className="stat-value">
-                {pendingPayrolls
-                  .filter(p => p.currency === 'INR')
-                  .reduce((sum, p) => sum + p.totalAmount, 0)
-                  .toLocaleString('en-IN', {
-                    style: 'currency',
-                    currency: 'INR',
-                    minimumFractionDigits: 0
-                  })}
-              </div>
-              <div className="stat-label">INR Amount</div>
-            </div>
-          </div>
-              <div className="stat-card">
-                <div className="stat-icon employees"></div>
-            <div className="stat-content">
-              <div className="stat-value">
-                {pendingPayrolls.reduce((sum, p) => sum + p.employeeCount, 0)}
-              </div>
-              <div className="stat-label">Total Employees</div>
+              <div className="stat-value">{stats.rejected}</div>
+              <div className="stat-label">Rejected</div>
             </div>
           </div>
         </div>
 
-        {/* Search Bar */}
-        <div className="search-section">
-          <div className="search-container">
-            <div className="search-input-group">
-                  <div className="search-icon"></div>
-              <input
-                type="text"
-                className="search-input"
-                placeholder="Search by Batch ID (e.g., USD-2024-001, INR-2024-001)"
-                value={searchId}
-                onChange={(e) => setSearchId(e.target.value)}
-              />
-              {searchId && (
-                <button 
-                  className="search-clear"
-                  onClick={() => setSearchId('')}
-                >
-×
-                </button>
-              )}
-            </div>
-            <div className="search-info">
-              {searchId ? (
-                <span>Showing {pendingPayrolls.length} result{pendingPayrolls.length !== 1 ? 's' : ''} for "{searchId}"</span>
-              ) : (
-                <span>Search by batch ID to filter results</span>
-              )}
-            </div>
+        {/* Filter */}
+        <div className="filter-section">
+          <div className="filter-buttons">
+            <button 
+              className={`filter-btn ${filterStatus === 'all' ? 'active' : ''}`}
+              onClick={() => setFilterStatus('all')}
+            >
+              All ({stats.total})
+            </button>
+            <button 
+              className={`filter-btn ${filterStatus === 'approved' ? 'active' : ''}`}
+              onClick={() => setFilterStatus('approved')}
+            >
+              Approved ({stats.approved})
+            </button>
+            <button 
+              className={`filter-btn ${filterStatus === 'rejected' ? 'active' : ''}`}
+              onClick={() => setFilterStatus('rejected')}
+            >
+              Rejected ({stats.rejected})
+            </button>
           </div>
         </div>
 
-        {/* Payroll Cards */}
-        <div className="payrolls-section">
-          <div className="section-header">
-            <h2 className="section-title">Pending Payroll Batches</h2>
-            <div className="section-count">
-              {pendingPayrolls.length} batch{pendingPayrolls.length !== 1 ? 'es' : ''} pending
-            </div>
-          </div>
-
-          {pendingPayrolls.length === 0 ? (
+        {/* Approvals List */}
+        <div className="approvals-section">
+          {filteredApprovals.length === 0 ? (
             <div className="empty-state">
-              <div className="empty-icon">🎉</div>
-              <h3>All caught up!</h3>
-              <p>No payroll batches are currently pending approval.</p>
-              <div style={{ marginTop: '24px', display: 'flex', flexDirection: 'column', gap: '12px', alignItems: 'center' }}>
-                <p style={{ color: '#64748b', fontSize: '14px' }}>What would you like to do next?</p>
-                <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', justifyContent: 'center' }}>
-                  <button 
-                    className="btn btn-outline"
-                    onClick={() => window.location.reload()}
-                    style={{ fontSize: '14px' }}
-                  >
-                    🔄 Refresh Page
-                  </button>
-                  <button 
-                    className="btn btn-outline"
-                    onClick={() => {
-                      // Clear localStorage to reset demo data
-                      localStorage.removeItem('approvals');
-                      window.location.reload();
-                    }}
-                    style={{ fontSize: '14px' }}
-                  >
-                    🔄 Reset Demo Data
-                  </button>
-                  <button 
-                    className="btn btn-primary"
-                    onClick={() => window.location.href = '/approvals'}
-                    style={{ fontSize: '14px' }}
-                  >
-                    📋 View Reviewed Batches
-                  </button>
-                </div>
-                <div style={{ marginTop: '16px', padding: '16px', backgroundColor: '#f8fafc', borderRadius: '8px', border: '1px solid #e5e7eb', maxWidth: '400px', textAlign: 'center' }}>
-                  <p style={{ fontSize: '12px', color: '#64748b', margin: '0' }}>
-                    <strong>Demo Tip:</strong> Click "Reset Demo Data" to restore all sample batches for testing.
-                  </p>
-                </div>
-              </div>
+              <div className="empty-icon"></div>
+              <h3>No approvals found</h3>
+              <p>
+                {allApprovals.length === 0 
+                  ? "You haven't reviewed any payroll batches yet. Go to the main dashboard to review pending batches."
+                  : "No payroll batches match the selected filter."
+                }
+              </p>
             </div>
           ) : (
-            <div className="payrolls-grid">
-              {pendingPayrolls.map(payroll => (
-                <PayrollCard
-                  key={payroll.id}
-                  payroll={payroll}
-                  onViewDetails={handleViewDetails}
-                  onApprove={(id) => handleAuthPrompt('approve', id)}
-                  onReject={(id) => handleAuthPrompt('reject', id)}
-                  isLoading={isLoading}
-                />
+            <div className="approvals-grid">
+              {filteredApprovals.map(payroll => (
+                <div key={payroll.id} className="approval-card">
+                  <div className="approval-card-header">
+                    <div className="approval-card-title">
+                      <h3>{payroll.batchName}</h3>
+                      <div className={`status-badge status-${payroll.status}`}>
+                        {payroll.status === 'approved' ? '✅' : '❌'} 
+                        {payroll.status.toUpperCase()}
+                      </div>
+                    </div>
+                    <div className="approval-card-amount">
+                      {formatCurrency(payroll.totalAmount, payroll.currency)}
+                    </div>
+                  </div>
+
+                  <div className="approval-card-body">
+                    <div className="approval-details">
+                      <div className="approval-detail">
+                        <span className="detail-label">Employees</span>
+                        <span className="detail-value">{payroll.employeeCount}</span>
+                      </div>
+                      <div className="approval-detail">
+                        <span className="detail-label">Debit Account</span>
+                        <span className="detail-value">{payroll.debitAccount || 'N/A'}</span>
+                      </div>
+                      <div className="approval-detail">
+                        <span className="detail-label">Created By</span>
+                        <span className="detail-value">{payroll.createdBy}</span>
+                      </div>
+                      <div className="approval-detail">
+                        <span className="detail-label">Created</span>
+                        <span className="detail-value">{formatDate(payroll.createdDate)}</span>
+                      </div>
+                      <div className="approval-detail">
+                        <span className="detail-label">
+                          {payroll.status === 'approved' ? 'Approved' : 'Rejected'}
+                        </span>
+                        <span className="detail-value">{payroll.approvedDate ? formatDate(payroll.approvedDate) : '—'}</span>
+                      </div>
+                      {payroll.approvedBy && (
+                        <div className="approval-detail">
+                          <span className="detail-label">Approved By</span>
+                          <span className="detail-value">{payroll.approvedBy}</span>
+                        </div>
+                      )}
+                      {payroll.approvalComments && (
+                        <div className="approval-detail">
+                          <span className="detail-label">Comments</span>
+                          <span className="detail-value">{payroll.approvalComments}</span>
+                        </div>
+                      )}
+                    </div>
+
+                    {payroll.description && (
+                      <div className="approval-description">
+                        <p>{payroll.description}</p>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="approval-card-footer">
+                    <button 
+                      className="btn btn-primary"
+                      onClick={() => handleViewDetails(payroll)}
+                    >
+                      View Details
+                    </button>
+                  </div>
+                </div>
               ))}
             </div>
           )}
@@ -748,384 +667,20 @@ const ApproverPage = () => {
         {showDetailsModal && (
           <PayrollDetailsModal
             payroll={selectedPayroll}
-            employees={allEmployees.filter(e => String(e.batchId || '') === String(selectedPayroll?.id || ''))}
+            employees={allEmployees.filter(
+              (e)=>String(e.batchId || ' ') === String(selectedPayroll.id || '')
+            )}
             onClose={handleCloseModal}
-            onApprove={(id) => handleAuthPrompt('approve', id)}
-            onReject={(id) => handleAuthPrompt('reject', id)}
-            isLoading={isLoading}
+            onApprove={() => {}} // No approve action for completed approvals
+            onReject={() => {}} // No reject action for completed approvals
+            isLoading={false}
+            showActionButtons={false}
           />
         )}
-
-        {/* Authentication Modal */}
-        {showAuthModal && (
-          <div className="modal-overlay">
-            <div className="modal">
-              <div className="modal-header">
-                <h3 className="modal-title">Authentication Required</h3>
-                <button className="modal-close" onClick={handleAuthCancel}>×</button>
-              </div>
-              <div className="modal-body">
-                <p>Please enter your login password to {pendingAction?.action} this payroll batch:</p>
-                <div className="form-group">
-                  <label className="form-label">Password</label>
-                  <input
-                    type="password"
-                    className="form-input"
-                    value={authPassword}
-                    onChange={(e) => {
-                      setAuthPassword(e.target.value);
-                      setAuthError('');
-                    }}
-                    onKeyPress={(e) => {
-                      if (e.key === 'Enter' && authPassword.trim()) {
-                        handleAuthSubmit();
-                      }
-                    }}
-                    placeholder="Enter your login password"
-                    autoFocus
-                  />
-                  {authError && (
-                    <div style={{ color: '#ef4444', fontSize: '14px', marginTop: '8px' }}>
-                      {authError}
-                    </div>
-                  )}
-                </div>
-              </div>
-              <div className="modal-footer">
-                <button className="btn btn-outline" onClick={handleAuthCancel}>
-                  Cancel
-                </button>
-                <button 
-                  className="btn btn-primary" 
-                  onClick={handleAuthSubmit}
-                  disabled={!authPassword.trim() || isLoading}
-                >
-                  {isLoading ? 'Processing...' : (pendingAction?.action === 'approve' ? 'Approve' : 'Reject')}
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
       </div>
+    </div>
     </div>
   );
 };
 
-export default ApproverPage;
-
-
-// ✅ ApprovalService.js
-// Handles all approval-related API calls with JWT token automatically attached
-
-import { apiFetch } from "./api"; // make sure path is correct (e.g., './api')
-
-class ApprovalService {
-  
-  // ------------------ Get all pending batches ------------------
-  static async getPendingBatches() {
-    try {
-      const [approvalsRes, batchesRes, employeesRes] = await Promise.all([
-        apiFetch("/api/approvals/pending", { method: "GET" }),
-        apiFetch("/api/batches", { method: "GET" }),
-        apiFetch("/api/employees", { method: "GET" })
-      ]);
-
-      if (!approvalsRes.ok || !batchesRes.ok || !employeesRes.ok) {
-        throw new Error(`Error fetching pending data`);
-      }
-
-      const approvalsJson = await approvalsRes.json();
-      const batchesJson = await batchesRes.json();
-      const employeesJson = await employeesRes.json();
-
-      // Calculate totals by batchId
-      const totalsByBatchId = new Map();
-      if (Array.isArray(employeesJson)) {
-        for (const emp of employeesJson) {
-          const batchId = emp.batchId != null ? String(emp.batchId) : null;
-          if (!batchId) continue;
-          const amt = typeof emp.salaryAmount === "number"
-            ? emp.salaryAmount
-            : parseFloat(emp.salaryAmount || 0) || 0;
-          totalsByBatchId.set(batchId, (totalsByBatchId.get(batchId) || 0) + amt);
-        }
-      }
-
-      const approvalItems = (Array.isArray(approvalsJson) ? approvalsJson : [])
-        .filter(a => a && String(a.debitAccount || "").trim() && String(a.currency || "").trim())
-        .map(a => ({ ...a, approvalBatchId: a.id, batchId: a.batchId || null }));
-
-      const mappedFromBatches = (Array.isArray(batchesJson) ? batchesJson : [])
-        .filter(b => (b.paymentStatus || "").toLowerCase() === "pending")
-        .filter(b => String(b.debitAccount || "").trim() && String(b.currency || "").trim())
-        .map(b => {
-          const mapped = ApprovalService.transformFromBatchDto(b);
-          const total = totalsByBatchId.get(mapped.id) || 0;
-          mapped.totalAmount = total;
-          return { ...mapped, approvalBatchId: null, batchId: b.id };
-        });
-
-      const byId = new Map();
-      for (const a of approvalItems) byId.set(String(a.id), a);
-      for (const b of mappedFromBatches) {
-        const key = String(b.id);
-        if (!byId.has(key)) byId.set(key, b);
-      }
-
-      return Array.from(byId.values())
-        .filter(i => String(i.debitAccount || "").trim() && String(i.currency || "").trim());
-    } catch (error) {
-      console.error("Error fetching pending batches:", error);
-      throw error;
-    }
-  }
-
-  // ------------------ Get all reviewed batches ------------------
-  static async getReviewedBatches() {
-    try {
-      const response = await apiFetch("/api/approvals/reviewed", { method: "GET" });
-      if (!response.ok) throw new Error("Error fetching reviewed data");
-      
-      const batches = await response.json();
-      
-      const reviewed = (Array.isArray(batches) ? batches : [])
-        .map(b => ApprovalService.transformBatchData(b));
-
-      return reviewed;
-    } catch (error) {
-      console.error("Error fetching reviewed batches:", error);
-      throw error;
-    }
-  }
-
-  // ------------------ Get specific pending batch by ID ------------------
-  static async getPendingBatchById(id) {
-    try {
-      const response = await apiFetch(`/api/approvals/pending/${id}`, { method: "GET" });
-      if (!response.ok) throw new Error(`Error fetching pending batch: ${response.status}`);
-      return await response.json();
-    } catch (error) {
-      console.error("Error fetching pending batch:", error);
-      throw error;
-    }
-  }
-
-  // ------------------ Approve batch ------------------
-  static async approveBatch(id, approvalData) {
-    try {
-      const response = await apiFetch(`/api/approvals/${id}/approve`, {
-        method: "PUT",
-        body: JSON.stringify(approvalData)
-      });
-      if (!response.ok) {
-        const error = new Error(`Error approving batch: ${response.status}`);
-        error.status = response.status;
-        throw error;
-      }
-      return await response.json();
-    } catch (error) {
-      console.error("Error approving batch:", error);
-      throw error;
-    }
-  }
-
-  // ------------------ Reject batch ------------------
-  static async rejectBatch(id, approvalData) {
-    try {
-      const response = await apiFetch(`/api/approvals/${id}/reject`, {
-        method: "PUT",
-        body: JSON.stringify(approvalData)
-      });
-      if (!response.ok) {
-        const error = new Error(`Error rejecting batch: ${response.status}`);
-        error.status = response.status;
-        throw error;
-      }
-      return await response.json();
-    } catch (error) {
-      console.error("Error rejecting batch:", error);
-      throw error;
-    }
-  }
-
-  // ------------------ Create approval batch ------------------
-  static async createApprovalBatch(batchId, payload) {
-    const response = await apiFetch(`/api/approval-batches/create/${batchId}`, {
-      method: "POST",
-      body: JSON.stringify(payload || {})
-    });
-    if (!response.ok) throw new Error(`Error creating approval batch: ${response.status}`);
-    return await response.json();
-  }
-
-  // ------------------ Get approval statistics ------------------
-  static async getApprovalStatistics() {
-    try {
-      const response = await apiFetch("/api/approvals/statistics", { method: "GET" });
-      if (!response.ok) throw new Error(`Error fetching approval stats: ${response.status}`);
-      return await response.json();
-    } catch (error) {
-      console.error("Error fetching approval statistics:", error);
-      throw error;
-    }
-  }
-
-  // ------------------ Helpers ------------------
-  static transformBatchData(apiBatch) {
-    return {
-      id: apiBatch?.id != null ? String(apiBatch.id) : "",
-      batchName: apiBatch.batchName,
-      createdBy: apiBatch.createdBy,
-      createdDate: apiBatch.createdDate ? apiBatch.createdDate.split("T")[0] : new Date().toISOString().split("T")[0],
-      status: apiBatch.status,
-      totalAmount: apiBatch.totalAmount != null ? parseFloat(apiBatch.totalAmount) : 0,
-      currency: apiBatch.currency,
-      employeeCount: apiBatch.employeeCount,
-      approversRequired: apiBatch.approversRequired,
-      approversAssigned: apiBatch.approversAssigned,
-      debitAccount: apiBatch.debitAccount,
-      description: apiBatch.description,
-      approvedBy: apiBatch.approvedBy,
-      approvedDate: apiBatch.approvedDate ? apiBatch.approvedDate.split("T")[0] : null,
-      approvalComments: apiBatch.approvalComments,
-      approvalBatchId: apiBatch.approvalBatchId || null,
-      batchId: apiBatch.batchId || null
-    };
-  }
-
-  static transformFromBatchDto(batchDto) {
-    const paymentStatus = (batchDto.paymentStatus || "").toLowerCase();
-    return {
-      id: batchDto.id != null ? batchDto.id.toString() : "",
-      batchName: batchDto.name || "",
-      createdBy: batchDto.userId ?? batchDto.createdBy??'Unknown',
-      createdDate: batchDto.lastPaymentDate
-        ? String(batchDto.lastPaymentDate).split("T")[0]
-        : new Date().toISOString().split("T")[0],
-      status: paymentStatus || "pending",
-      totalAmount: 0,
-      currency: batchDto.currency || "USD",
-      employeeCount: typeof batchDto.employeeCount === "number" ? batchDto.employeeCount : 0,
-      approversRequired: 1,
-      approversAssigned: 0,
-      debitAccount: batchDto.debitAccount || "",
-      description: "",
-      approvedBy: batchDto.approvedBy || "",
-      approvedDate: batchDto.approvedDate ? String(batchDto.approvedDate).split("T")[0] : null,
-      approvalComments: batchDto.approvalComments || ""
-    };
-  }
-}
-
-export default ApprovalService;
-
-
-package paymentinitiationbackend.model;
-
-import jakarta.persistence.*;
-import java.time.LocalDateTime;
-
-@Entity
-@Table(name = "approvals")
-public class Approval {
-
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    private Long id;
-
-    @Column(name = "batch_id", nullable = false)
-    private Long batchId;
-
-    @Column(name = "approved_by", nullable = false, length = 100)
-    private String approvedBy;
-
-    @Column(name = "approved_date", nullable = false)
-    private LocalDateTime approvedDate;
-
-    @Column(name = "status", nullable = false, length = 20)
-    private String status; // "approved" or "rejected"
-
-    @Column(name = "comments", length = 1000)
-    private String comments;
-
-    // Constructors
-    public Approval() {
-    }
-
-    public Approval(Long batchId, String approvedBy, String status, String comments) {
-        this.batchId = batchId;
-        this.approvedBy = approvedBy;
-        this.status = status;
-        this.comments = comments;
-        this.approvedDate = LocalDateTime.now();
-    }
-
-    // Getters and Setters
-    public Long getId() {
-        return id;
-    }
-
-    public void setId(Long id) {
-        this.id = id;
-    }
-
-    public Long getBatchId() {
-        return batchId;
-    }
-
-    public void setBatchId(Long batchId) {
-        this.batchId = batchId;
-    }
-
-    public String getApprovedBy() {
-        return approvedBy;
-    }
-
-    public void setApprovedBy(String approvedBy) {
-        this.approvedBy = approvedBy;
-    }
-
-    public LocalDateTime getApprovedDate() {
-        return approvedDate;
-    }
-
-    public void setApprovedDate(LocalDateTime approvedDate) {
-        this.approvedDate = approvedDate;
-    }
-
-    public String getStatus() {
-        return status;
-    }
-
-    public void setStatus(String status) {
-        this.status = status;
-    }
-
-    public String getComments() {
-        return comments;
-    }
-
-    public void setComments(String comments) {
-        this.comments = comments;
-    }
-
-    @PrePersist
-    protected void onCreate() {
-        if (approvedDate == null) {
-            approvedDate = LocalDateTime.now();
-        }
-    }
-
-    @Override
-    public String toString() {
-        return "Approval{" +
-                "id=" + id +
-                ", batchId=" + batchId +
-                ", approvedBy='" + approvedBy + '\'' +
-                ", approvedDate=" + approvedDate +
-                ", status='" + status + '\'' +
-                ", comments='" + comments + '\'' +
-                '}';
-    }
-}
-
+export default ApprovalsPage;
