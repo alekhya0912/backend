@@ -1,0 +1,527 @@
+package paymentinitiationbackend.controller;
+
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.responses.ApiResponses;
+import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.transaction.Transactional;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import paymentinitiationbackend.dto.ApprovalBatchDto;
+import paymentinitiationbackend.dto.ApprovalRequestDto;
+import paymentinitiationbackend.dto.ApprovalStatisticsDto;
+import paymentinitiationbackend.model.Approval;
+import paymentinitiationbackend.model.BankAccount;
+import paymentinitiationbackend.model.Batch;
+import paymentinitiationbackend.model.Employee;
+import paymentinitiationbackend.model.User;
+import paymentinitiationbackend.repository.ApprovalRepository;
+import paymentinitiationbackend.repository.BankAccountRepository;
+import paymentinitiationbackend.repository.BatchRepository;
+import paymentinitiationbackend.repository.EmployeeRepository;
+import paymentinitiationbackend.repository.UserRepository;
+import paymentinitiationbackend.service.ApprovalService;
+import paymentinitiationbackend.config.JwtTokenUtil;
+import org.springframework.security.crypto.password.PasswordEncoder;
+
+import java.math.BigDecimal;
+import java.util.List;
+import java.util.Objects;
+import java.util.UUID;
+
+@RestController
+@RequestMapping("/api/approvals")
+@Tag(name = "Approval Management", description = "APIs for managing payroll batch approvals")
+public class ApprovalController {
+
+    private final ApprovalService approvalService;
+    private final BatchRepository batchRepository;
+    private final EmployeeRepository employeeRepository;
+    private final BankAccountRepository bankAccountRepository;
+    private final UserRepository userRepository;
+    private final ApprovalRepository approvalRepository;
+    private final JwtTokenUtil jwtTokenUtil;
+    private final PasswordEncoder passwordEncoder;
+
+    @Autowired
+    public ApprovalController(ApprovalService approvalService,
+                              BatchRepository batchRepository,
+                              EmployeeRepository employeeRepository,
+                              BankAccountRepository bankAccountRepository,
+                              UserRepository userRepository,
+                              ApprovalRepository approvalRepository,
+                              JwtTokenUtil jwtTokenUtil,
+                              PasswordEncoder passwordEncoder) {
+        this.approvalService = approvalService;
+        this.batchRepository = batchRepository;
+        this.employeeRepository = employeeRepository;
+        this.bankAccountRepository=bankAccountRepository;
+        this.userRepository = userRepository;
+        this.approvalRepository = approvalRepository;
+        this.jwtTokenUtil = jwtTokenUtil;
+        this.passwordEncoder = passwordEncoder;
+    }
+
+    @GetMapping("/pending")
+    @Operation(summary = "Get pending batches", description = "Retrieve all batches that are pending approval")
+    @ApiResponses(value = {
+            @ApiResponse(responseCode = "200", description = "Successfully retrieved pending batches",
+                    content = @Content(schema = @Schema(implementation = ApprovalBatchDto.class))),
+            @ApiResponse(responseCode = "500", description = "Internal server error")
+    })
+    public ResponseEntity<List<ApprovalBatchDto>> getPendingBatches() {
+        try {
+            List<Batch> batches = batchRepository.findAll();
+            List<ApprovalBatchDto> pending = batches.stream()
+                    .filter(b -> b.getPaymentStatus() != null && b.getPaymentStatus().equalsIgnoreCase("Pending"))
+                    .filter(b -> b.getDebitAccount() != null && !b.getDebitAccount().trim().isEmpty())
+                    .filter(b -> b.getCurrency() != null && !b.getCurrency().trim().isEmpty())
+                    .map(this::mapBatchToApprovalDto)
+                    .toList();
+            return ResponseEntity.ok(pending);
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
+    }
+
+    @GetMapping("/reviewed")
+    @Operation(summary = "Get reviewed batches", description = "Retrieve all batches that have been approved or rejected")
+    @ApiResponses(value = {
+            @ApiResponse(responseCode = "200", description = "Successfully retrieved reviewed batches",
+                    content = @Content(schema = @Schema(implementation = ApprovalBatchDto.class))),
+            @ApiResponse(responseCode = "500", description = "Internal server error")
+    })
+    public ResponseEntity<List<ApprovalBatchDto>> getReviewedBatches() {
+        try {
+            List<Batch> batches = batchRepository.findAll();
+            System.out.println("Total batches found: " + batches.size());
+            // Filter for approved or rejected batches
+            List<ApprovalBatchDto> reviewed = batches.stream()
+                    .filter(b -> {
+                        String status = b.getPaymentStatus();
+                        System.out.println("Batch ID: " + b.getId() + ", Status: " + status);
+                        boolean isReviewed = status != null && (status.equalsIgnoreCase("approved") || status.equalsIgnoreCase("rejected"));
+                        if (isReviewed) {
+                            System.out.println("Batch " + b.getId() + " is reviewed (status: " + status + ")");
+                        }
+                        return isReviewed;
+                    })
+                    .map(batch -> {
+                        try {
+                            return mapBatchToApprovalDto(batch);
+                        } catch (Exception e) {
+                            System.err.println("Error mapping batch " + batch.getId() + ": " + e.getMessage());
+                            e.printStackTrace();
+                            return null;
+                        }
+                    })
+                    .filter(java.util.Objects::nonNull)
+                    .toList();
+            System.out.println("Reviewed batches count: " + reviewed.size());
+            return ResponseEntity.ok(reviewed);
+        } catch (Exception e) {
+            System.err.println("Error in getReviewedBatches: " + e.getMessage());
+            e.printStackTrace(); // Log the exception for debugging
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(java.util.Collections.emptyList());
+        }
+    }
+
+    @GetMapping("/pending/{id}")
+    @Operation(summary = "Get pending batch by ID", description = "Retrieve a specific pending batch by its ID")
+    @ApiResponses(value = {
+            @ApiResponse(responseCode = "200", description = "Successfully retrieved the batch",
+                    content = @Content(schema = @Schema(implementation = ApprovalBatchDto.class))),
+            @ApiResponse(responseCode = "404", description = "Batch not found"),
+            @ApiResponse(responseCode = "400", description = "Batch is not pending approval")
+    })
+    public ResponseEntity<ApprovalBatchDto> getPendingBatchById(
+            @Parameter(description = "Batch ID", required = true) @PathVariable Long id) {
+        try {
+            return batchRepository.findById(id)
+                    .filter(b -> b.getPaymentStatus() != null && b.getPaymentStatus().equalsIgnoreCase("Pending"))
+                    .map(this::mapBatchToApprovalDto)
+                    .map(ResponseEntity::ok)
+                    .orElse(ResponseEntity.notFound().build());
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
+    }
+
+//    @PutMapping("/{id}/approve")
+//    @Operation(summary = "Approve a batch", description = "Approve a pending batch with authentication")
+//    @ApiResponses(value = {
+//            @ApiResponse(responseCode = "200", description = "Batch approved successfully"),
+//            @ApiResponse(responseCode = "400", description = "Invalid request or batch not pending"),
+//            @ApiResponse(responseCode = "401", description = "Authentication failed"),
+//            @ApiResponse(responseCode = "404", description = "Batch not found"),
+//            @ApiResponse(responseCode = "500", description = "Internal server error")
+//    })
+//    public ResponseEntity<ApprovalBatchDto> approveBatch(
+//            @Parameter(description = "Batch ID", required = true) @PathVariable Long id,
+//            @RequestBody ApprovalRequestDto approvalRequest) {
+//        try {
+//            if (!"approver123".equals(approvalRequest.getPassword())) {
+//                return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+//            }
+//            Batch batch = batchRepository.findById(id).orElse(null);
+//            if (batch == null) return ResponseEntity.notFound().build();
+//            if (batch.getPaymentStatus() == null || !batch.getPaymentStatus().equalsIgnoreCase("Pending")) {
+//                return ResponseEntity.status(HttpStatus.BAD_REQUEST).build();
+//            }
+//            batch.setPaymentStatus("approved");
+//            batch.setLastPaymentDate(java.time.LocalDateTime.now());
+//            batchRepository.save(batch);
+//            ApprovalBatchDto dto = mapBatchToApprovalDto(batch);
+//            dto.setApprovedBy(approvalRequest.getApproverName());
+//            dto.setApprovedDate(java.time.LocalDateTime.now());
+//            dto.setApprovalComments(approvalRequest.getComments());
+//            dto.setStatus("approved");
+//            return ResponseEntity.ok(dto);
+//        } catch (Exception e) {
+//            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+//        }
+//    }
+
+    @PutMapping("/{id}/approve")
+    @Transactional
+    @Operation(summary = "Approve a batch", description = "Approve a pending batch with authentication")
+    @ApiResponses(value = {
+            @ApiResponse(responseCode = "200", description = "Batch approved successfully"),
+            @ApiResponse(responseCode = "400", description = "Invalid request or batch not pending"),
+            @ApiResponse(responseCode = "401", description = "Authentication failed"),
+            @ApiResponse(responseCode = "404", description = "Batch not found"),
+            @ApiResponse(responseCode = "500", description = "Internal server error")
+    })
+    public ResponseEntity<ApprovalBatchDto> approveBatch(
+            @Parameter(description = "Batch ID", required = true) @PathVariable Long id,
+            @RequestBody ApprovalRequestDto approvalRequest,
+            @RequestHeader(value = "Authorization", required = false) String authHeader) {
+        try {
+            // Extract user from JWT token
+            String currentUserId = null;
+            if (authHeader != null && authHeader.startsWith("Bearer ")) {
+                String token = authHeader.substring(7);
+                if (jwtTokenUtil.validateToken(token)) {
+                    currentUserId = jwtTokenUtil.getUsernameFromToken(token);
+                }
+            }
+            
+            if (currentUserId == null) {
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+            }
+            
+            // Get user and verify password
+            User user = userRepository.findByUserId(currentUserId).orElse(null);
+            if (user == null) {
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+            }
+            
+            // Verify password
+            if (!passwordEncoder.matches(approvalRequest.getPassword(), user.getPassword())) {
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+            }
+            
+            // Reload batch from database to get latest state
+            Batch batch = batchRepository.findById(id).orElse(null);
+            if (batch == null) {
+                System.out.println("Batch not found: " + id);
+                return ResponseEntity.notFound().build();
+            }
+            
+            // Check batch status - allow approval if status is Pending
+            String batchStatus = batch.getPaymentStatus();
+            System.out.println("Batch " + id + " current status: '" + batchStatus + "'");
+            if (batchStatus == null || batchStatus.trim().isEmpty()) {
+                System.out.println("Batch " + id + " has null or empty status");
+                return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(null);
+            }
+            if (!batchStatus.trim().equalsIgnoreCase("Pending")) {
+                System.out.println("Batch " + id + " is not pending. Current status: '" + batchStatus + "'. Cannot approve.");
+                return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(null);
+            }
+
+            // Check if this user has already approved this batch
+            boolean alreadyApproved = approvalRepository.existsByBatchIdAndApprovedByAndStatus(id, currentUserId, "approved");
+            if (alreadyApproved) {
+                System.out.println("User " + currentUserId + " has already approved batch " + id);
+                return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(null);
+            }
+
+            // Check if batch has been rejected (count > 0 means rejected)
+            long rejectedCount = approvalRepository.countByBatchIdAndStatus(id, "rejected");
+            if (rejectedCount > 0) {
+                System.out.println("Batch " + id + " has been rejected. Rejected count: " + rejectedCount);
+                return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(null);
+            }
+
+            List<Employee> emps = employeeRepository.findByBatchId(id);
+            BigDecimal total=emps.stream()
+                    .map(Employee::getSalaryAmount)
+                    .filter(Objects::nonNull)
+                    .reduce(BigDecimal.ZERO,BigDecimal::add);
+
+            // Calculate required approvers
+            int approversRequired = calculateApproversRequired(total, batch.getCurrency());
+            System.out.println("Batch " + id + " requires " + approversRequired + " approvers. Total: " + total + ", Currency: " + batch.getCurrency());
+            
+            // Count current approved approvals (before adding this one)
+            long approvedCountBefore = approvalRepository.countByBatchIdAndStatus(id, "approved");
+            System.out.println("Current approved count before this approval: " + approvedCountBefore);
+            
+            // Create approval record for this approver
+            Approval approval = new Approval();
+            approval.setBatchId(id);
+            approval.setApprovedBy(currentUserId);
+            approval.setStatus("approved");
+            approval.setComments(approvalRequest.getComments());
+            approval.setApprovedDate(java.time.LocalDateTime.now());
+            approvalRepository.save(approval);
+            approvalRepository.flush(); // Ensure the approval is persisted before checking count
+            System.out.println("Created approval record for user: " + currentUserId);
+            
+            // Check if we've reached the required number of approvers
+            long approvedCount = approvalRepository.countByBatchIdAndStatus(id, "approved");
+            System.out.println("Current approved count after this approval: " + approvedCount + " / " + approversRequired);
+            
+            if (approvedCount >= approversRequired) {
+                System.out.println("All required approvers have approved! Processing payment...");
+                // All required approvers have approved - process the payment
+                String accNum=batch.getDebitAccount();
+                if(accNum==null || accNum.isBlank()){
+                    return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(null);
+                }
+
+                BankAccount acct=bankAccountRepository.findByAccountNumber(accNum).orElse(null);
+                if(acct==null){
+                    return ResponseEntity.status(HttpStatus.NOT_FOUND).build();
+                }
+                if(acct.getBalance().compareTo(total)<0){
+                    return ResponseEntity.status(HttpStatus.CONFLICT).build();
+                }
+                acct.setBalance(acct.getBalance().subtract(total));
+                bankAccountRepository.save(acct);
+
+                for(Employee e:emps){
+                    if(e.getPaymentRef() == null || e.getPaymentRef().isBlank()){
+                        String token = "TRX-"+ id +"-"+ UUID.randomUUID().toString().replace("-","").substring(0,8).toUpperCase();
+                        e.setPaymentRef(token);
+                    }
+                }
+
+                employeeRepository.saveAll(emps);
+                batch.setPaymentStatus("approved");
+                batch.setLastPaymentDate(java.time.LocalDateTime.now());
+                batchRepository.save(batch);
+                System.out.println("Batch " + id + " fully approved and payment processed!");
+            } else {
+                System.out.println("Batch " + id + " still waiting for " + (approversRequired - approvedCount) + " more approver(s). Status remains Pending.");
+            }
+            // If not fully approved yet, batch status remains "Pending"
+            
+            // Refresh batch from database to get latest status
+            batch = batchRepository.findById(id).orElse(batch);
+            ApprovalBatchDto dto = mapBatchToApprovalDto(batch);
+            dto.setApprovedBy(currentUserId);
+            dto.setApprovedDate(approval.getApprovedDate());
+            dto.setApprovalComments(approvalRequest.getComments());
+            dto.setStatus(batch.getPaymentStatus() != null ? batch.getPaymentStatus().toLowerCase() : "pending");
+            return ResponseEntity.ok(dto);
+        } catch (Exception e) {
+            System.err.println("Error approving batch " + id + ": " + e.getMessage());
+            e.printStackTrace();
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
+    }
+
+    @PutMapping("/{id}/reject")
+    @Operation(summary = "Reject a batch", description = "Reject a pending batch with authentication")
+    @ApiResponses(value = {
+            @ApiResponse(responseCode = "200", description = "Batch rejected successfully"),
+            @ApiResponse(responseCode = "400", description = "Invalid request or batch not pending"),
+            @ApiResponse(responseCode = "401", description = "Authentication failed"),
+            @ApiResponse(responseCode = "404", description = "Batch not found"),
+            @ApiResponse(responseCode = "500", description = "Internal server error")
+    })
+    public ResponseEntity<ApprovalBatchDto> rejectBatch(
+            @Parameter(description = "Batch ID", required = true) @PathVariable Long id,
+            @RequestBody ApprovalRequestDto approvalRequest,
+            @RequestHeader(value = "Authorization", required = false) String authHeader) {
+        try {
+            // Extract user from JWT token
+            String currentUserId = null;
+            if (authHeader != null && authHeader.startsWith("Bearer ")) {
+                String token = authHeader.substring(7);
+                if (jwtTokenUtil.validateToken(token)) {
+                    currentUserId = jwtTokenUtil.getUsernameFromToken(token);
+                }
+            }
+            
+            if (currentUserId == null) {
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+            }
+            
+            // Get user and verify password
+            User user = userRepository.findByUserId(currentUserId).orElse(null);
+            if (user == null) {
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+            }
+            
+            // Verify password
+            if (!passwordEncoder.matches(approvalRequest.getPassword(), user.getPassword())) {
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+            }
+            
+            Batch batch = batchRepository.findById(id).orElse(null);
+            if (batch == null) return ResponseEntity.notFound().build();
+            if (batch.getPaymentStatus() == null || !batch.getPaymentStatus().equalsIgnoreCase("Pending")) {
+                return ResponseEntity.status(HttpStatus.BAD_REQUEST).build();
+            }
+            
+            // Rejection immediately rejects the batch - no need for multiple approvers
+            batch.setPaymentStatus("rejected");
+            batch.setLastPaymentDate(java.time.LocalDateTime.now());
+            batchRepository.save(batch);
+            
+            // Create approval record for rejection
+            Approval approval = new Approval();
+            approval.setBatchId(id);
+            approval.setApprovedBy(currentUserId);
+            approval.setStatus("rejected");
+            approval.setComments(approvalRequest.getComments());
+            approval.setApprovedDate(java.time.LocalDateTime.now());
+            approvalRepository.save(approval);
+            
+            ApprovalBatchDto dto = mapBatchToApprovalDto(batch);
+            dto.setApprovedBy(currentUserId);
+            dto.setApprovedDate(approval.getApprovedDate());
+            dto.setApprovalComments(approvalRequest.getComments());
+            dto.setStatus("rejected");
+            return ResponseEntity.ok(dto);
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
+    }
+
+    private ApprovalBatchDto mapBatchToApprovalDto(Batch batch) {
+        java.util.List<Employee> emps = employeeRepository.findByBatchId(batch.getId());
+        java.math.BigDecimal total = emps.stream()
+                .map(Employee::getSalaryAmount)
+                .filter(java.util.Objects::nonNull)
+                .reduce(java.math.BigDecimal.ZERO, java.math.BigDecimal::add);
+        ApprovalBatchDto dto = new ApprovalBatchDto();
+        dto.setId(batch.getId());
+        dto.setBatchName(batch.getName());
+        dto.setCreatedBy(batch.getUserId());
+        dto.setCreatedDate(java.time.LocalDateTime.now());
+        dto.setStatus(batch.getPaymentStatus() != null ? batch.getPaymentStatus().toLowerCase() : "pending");
+        dto.setTotalAmount(total);
+        dto.setCurrency(batch.getCurrency());
+        dto.setEmployeeCount(emps.size());
+        
+        // Calculate approvers required based on amount and currency
+        int approversRequired = calculateApproversRequired(total, batch.getCurrency());
+        dto.setApproversRequired(approversRequired);
+        
+        // Count how many approvers have actually approved this batch
+        long approversAssigned = approvalRepository.countByBatchIdAndStatus(batch.getId(), "approved");
+        dto.setApproversAssigned((int) approversAssigned);
+        
+        dto.setDebitAccount(batch.getDebitAccount());
+        dto.setDescription(null);
+        
+        // Get the most recent approval information from Approval table
+        java.util.List<Approval> approvals = approvalRepository.findAllByBatchId(batch.getId());
+        if (!approvals.isEmpty()) {
+            // Get the most recent approval (for display purposes)
+            Approval latestApproval = approvals.stream()
+                    .max(java.util.Comparator.comparing(Approval::getApprovedDate))
+                    .orElse(approvals.get(0));
+            dto.setApprovedBy(latestApproval.getApprovedBy());
+            dto.setApprovedDate(latestApproval.getApprovedDate());
+            dto.setApprovalComments(latestApproval.getComments());
+        }
+        
+        return dto;
+    }
+    
+    /**
+     * Calculate number of approvers required based on amount and currency
+     * Minimum: 1 approver
+     * INR: Above 7 lakhs (700,000) requires 2 approvers
+     * USD: Above 100k (100,000) requires 2 approvers
+     */
+    private int calculateApproversRequired(java.math.BigDecimal amount, String currency) {
+        if (amount == null) return 1;
+        
+        if ("USD".equalsIgnoreCase(currency)) {
+            // USD: Above $100,000 requires 2 approvers
+            java.math.BigDecimal threshold = new java.math.BigDecimal("100000");
+            return amount.compareTo(threshold) > 0 ? 2 : 1;
+        } else if ("INR".equalsIgnoreCase(currency)) {
+            // INR: Above ₹7,00,000 (7 lakhs) requires 2 approvers
+            java.math.BigDecimal threshold = new java.math.BigDecimal("700000");
+            return amount.compareTo(threshold) > 0 ? 2 : 1;
+        }
+        
+        return 1; // Default to 1 approver
+    }
+
+    @GetMapping("/{id}/check-approval")
+    @Operation(summary = "Check if current user has approved a batch", description = "Check if the current logged-in user has already approved the specified batch")
+    @ApiResponses(value = {
+            @ApiResponse(responseCode = "200", description = "Check completed successfully"),
+            @ApiResponse(responseCode = "401", description = "Unauthorized"),
+            @ApiResponse(responseCode = "404", description = "Batch not found")
+    })
+    public ResponseEntity<java.util.Map<String, Object>> checkUserApproval(
+            @Parameter(description = "Batch ID", required = true) @PathVariable Long id,
+            @RequestHeader(value = "Authorization", required = false) String authHeader) {
+        try {
+            String currentUserId = null;
+            if (authHeader != null && authHeader.startsWith("Bearer ")) {
+                String token = authHeader.substring(7);
+                if (jwtTokenUtil.validateToken(token)) {
+                    currentUserId = jwtTokenUtil.getUsernameFromToken(token);
+                }
+            }
+            
+            if (currentUserId == null) {
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+            }
+            
+            boolean hasApproved = approvalRepository.existsByBatchIdAndApprovedByAndStatus(id, currentUserId, "approved");
+            boolean hasRejected = approvalRepository.existsByBatchIdAndApprovedByAndStatus(id, currentUserId, "rejected");
+            
+            java.util.Map<String, Object> response = new java.util.HashMap<>();
+            response.put("hasApproved", hasApproved);
+            response.put("hasRejected", hasRejected);
+            
+            return ResponseEntity.ok(response);
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
+    }
+
+    @GetMapping("/statistics")
+    @Operation(summary = "Get approval statistics", description = "Get statistics about pending and reviewed batches")
+    @ApiResponses(value = {
+            @ApiResponse(responseCode = "200", description = "Successfully retrieved statistics",
+                    content = @Content(schema = @Schema(implementation = ApprovalStatisticsDto.class))),
+            @ApiResponse(responseCode = "500", description = "Internal server error")
+    })
+    public ResponseEntity<ApprovalStatisticsDto> getApprovalStatistics() {
+        try {
+            ApprovalStatisticsDto statistics = approvalService.getApprovalStatistics();
+            return ResponseEntity.ok(statistics);
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
+    }
+
+}
